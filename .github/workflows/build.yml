@@ -1,0 +1,110 @@
+name: wick-build
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Direct .apk download link for Minecraft 1.26.52 (arm64)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: split sources
+        run: |
+          python3 - <<'PYEOF'
+          import os, re
+          text = open('wick-sources.txt', encoding='utf-8').read()
+          parts = re.split(r'^===FILE:(.+?)===\s*$', text, flags=re.MULTILINE)
+          for i in range(1, len(parts), 2):
+              path = parts[i].strip()
+              content = parts[i+1].strip() + '\n'
+              d = os.path.dirname(path)
+              if d: os.makedirs(d, exist_ok=True)
+              open(path, 'w', encoding='utf-8').write(content)
+              print('wrote', path, len(content), 'bytes')
+          PYEOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: toolchain
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264" >/dev/null
+          echo "BT=$ANDROID_SDK_ROOT/build-tools/34.0.0" >> "$GITHUB_ENV"
+          echo "NDK=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build >/dev/null
+          curl -sSL https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -o apktool.jar
+
+      - name: native build
+        run: |
+          cmake -S native -B native/build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release
+          cmake --build native/build
+
+      - name: dex build
+        run: |
+          mkdir -p build/classes build/dex
+          javac -source 1.8 -target 1.8 \
+            -classpath "$ANDROID_SDK_ROOT/platforms/android-34/android.jar" \
+            -d build/classes $(find java -name "*.java")
+          "$BT/d8" --release --min-api 28 \
+            --lib "$ANDROID_SDK_ROOT/platforms/android-34/android.jar" \
+            --output build/dex $(find build/classes -name "*.class")
+
+      - name: download base apk
+        run: |
+          curl -L --fail --retry 3 -A "Mozilla/5.0" -o build/base.apk "${{ inputs.apk_url }}"
+          unzip -l build/base.apk >/dev/null || (echo "::error::That link did not return an APK." && exit 1)
+          ls -lh build/base.apk
+
+      - name: patch and repack
+        run: |
+          java -Xmx8g -jar apktool.jar d -s -f -o build/dec build/base.apk
+          python3 tools/patch_manifest.py build/dec/AndroidManifest.xml
+          mkdir -p build/dec/lib/arm64-v8a
+          cp native/build/libwick.so build/dec/lib/arm64-v8a/
+          NEXT=2
+          while [ -e "build/dec/classes${NEXT}.dex" ]; do NEXT=$((NEXT+1)); done
+          cp build/dex/classes.dex "build/dec/classes${NEXT}.dex"
+          java -Xmx8g -jar apktool.jar b build/dec -o build/unsigned.apk --use-aapt2
+
+      - name: sign
+        run: |
+          if [ ! -f tools/keystore.b64 ]; then
+            mkdir -p build
+            keytool -genkeypair -keystore build/wick.keystore -alias wick \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass wickpass -keypass wickpass -dname "CN=Wick"
+            base64 -w0 build/wick.keystore > tools/keystore.b64
+            git config user.email wick@local
+            git config user.name wick
+            git add tools/keystore.b64
+            git commit -m "keystore" || true
+            git push || true
+          fi
+          base64 -d tools/keystore.b64 > build/wick.keystore
+          "$BT/zipalign" -f -p 4 build/unsigned.apk build/aligned.apk
+          "$BT/apksigner" sign --ks build/wick.keystore \
+            --ks-pass pass:wickpass --key-pass pass:wickpass \
+            --out build/wick-signed.apk build/aligned.apk
+          ls -lh build/wick-signed.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wick-apk
+          path: build/wick-signed.apk
